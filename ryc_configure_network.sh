@@ -86,27 +86,12 @@ list_interfaces() {
   INTERFACE_NUMBERS=()
   i=1
   for IFACE in "${INTERFACES_LIST[@]}"; do
-    INTERFACE_NUMBERS+=("$IFACE")
+    INTERFACE_NUMBERS[$i]="$IFACE"
     IP_ADDR=${INTERFACE_IP_MAP["$IFACE"]}
     CONFIG_TYPE=${INTERFACE_CONFIG_TYPE_MAP["$IFACE"]}
     printf "%-5s %-15s %-20s %-15s\n" "[$i]" "$IFACE" "$IP_ADDR" "$CONFIG_TYPE"
     i=$((i+1))
   done
-}
-
-# Function to test connectivity
-test_connectivity() {
-  TEST_IPS=("8.8.8.8" "1.1.1.1")
-  for IP in "${TEST_IPS[@]}"; do
-    log "Testing connectivity to $IP..."
-    if ping -c 3 -W 2 "$IP" > /dev/null 2>&1; then
-      log "Successfully reached $IP."
-      return 0
-    else
-      log "Failed to reach $IP."
-    fi
-  done
-  return 1
 }
 
 # Collect user inputs before making changes
@@ -123,7 +108,7 @@ collect_inputs() {
     for IDX in "${!INTERFACE_NUMBERS[@]}"; do
       IFACE="${INTERFACE_NUMBERS[$IDX]}"
       if [ "$IFACE" == "vmbr0" ]; then
-        DEFAULT_INTERFACE_NUM=$((IDX+1))
+        DEFAULT_INTERFACE_NUM="$IDX"
         DEFAULT_INTERFACE="vmbr0"
         break
       fi
@@ -147,8 +132,7 @@ collect_inputs() {
         log "No interface selected. Exiting."
         exit 1
       fi
-      INTERFACE_INDEX=$((INTERFACE_NUM-1))
-      INTERFACE="${INTERFACE_NUMBERS[$INTERFACE_INDEX]}"
+      INTERFACE="${INTERFACE_NUMBERS[$INTERFACE_NUM]}"
     fi
   fi
 
