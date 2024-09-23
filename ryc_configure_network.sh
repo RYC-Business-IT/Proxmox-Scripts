@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # Script to configure Proxmox VE networking for DHCP or Static IP
+# Includes backup preservation and restoration functionality
 # Usage: ./network-config.sh [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]
 #        [--gateway GATEWAY] [--dns DNS_SERVERS] [--hostname HOSTNAME]
 #        [--interface INTERFACE] [--bridge-ports PORTS] [--test-ip TEST_IP]
+#        [--no-confirm] [--restore-backup]
 
 # Default variables
 MODE=""
@@ -15,15 +17,20 @@ HOSTNAME=""
 INTERFACE=""
 BRIDGE_PORTS=""
 TEST_IPS=()
+NO_CONFIRM=0
+RESTORE_BACKUP=0
 DHCP_HOOK_SCRIPT="/etc/dhcp/dhclient-exit-hooks.d/update-etc-hosts"
 LOGFILE="/var/log/network-config.log"
-BACKUP_DIR="/var/backups/network-config-$(date +%F_%T)"
+BACKUP_DIR="/var/backups/network-config"
+TIMESTAMP=$(date +%F_%T)
+PHYSICAL_INTERFACES=""
 
 # Function to display usage
 usage() {
   echo "Usage: $0 [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]"
   echo "          [--gateway GATEWAY] [--dns DNS_SERVERS] [--hostname HOSTNAME]"
   echo "          [--interface INTERFACE] [--bridge-ports PORTS] [--test-ip TEST_IP]"
+  echo "          [--no-confirm] [--restore-backup]"
   exit 1
 }
 
@@ -46,6 +53,8 @@ while [[ "$#" -gt 0 ]]; do
     --interface) INTERFACE="$2"; shift ;;
     --bridge-ports) BRIDGE_PORTS="$2"; shift ;;
     --test-ip) TEST_IPS+=("$2"); shift ;;
+    --no-confirm) NO_CONFIRM=1 ;;
+    --restore-backup) RESTORE_BACKUP=1 ;;
     *) echo "Unknown parameter passed: $1"; usage ;;
   esac
   shift
@@ -94,10 +103,13 @@ test_connectivity() {
 # Function to rollback changes
 rollback_changes() {
   log "Rolling back to previous network configuration."
-  if [ -d "$BACKUP_DIR" ]; then
-    cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces
-    cp "$BACKUP_DIR/hosts.bak" /etc/hosts
-    hostnamectl set-hostname "$CURRENT_HOSTNAME"
+  if [ -d "$BACKUP_DIR/latest" ]; then
+    cp "$BACKUP_DIR/latest/interfaces.bak" /etc/network/interfaces
+    cp "$BACKUP_DIR/latest/hosts.bak" /etc/hosts
+    if [ -f "$BACKUP_DIR/latest/hostname.bak" ]; then
+      RESTORED_HOSTNAME=$(cat "$BACKUP_DIR/latest/hostname.bak")
+      hostnamectl set-hostname "$RESTORED_HOSTNAME"
+    fi
     log "Restored /etc/network/interfaces, /etc/hosts, and hostname."
     ifreload -a
     log "Reapplied original network configuration with ifreload -a."
@@ -105,6 +117,50 @@ rollback_changes() {
     log "Backup directory not found. Cannot rollback."
   fi
 }
+
+# Function to restore from backup
+restore_from_backup() {
+  log "Restoring from backup."
+  rollback_changes
+  exit 0
+}
+
+# Check for existing backups and offer to restore
+if [ "$RESTORE_BACKUP" -eq 1 ]; then
+  if [ -d "$BACKUP_DIR/latest" ]; then
+    restore_from_backup
+  else
+    log "No backup found to restore."
+    exit 1
+  fi
+fi
+
+if [ -d "$BACKUP_DIR/latest" ]; then
+  echo "A previous backup was found."
+  if [ "$NO_CONFIRM" -eq 1 ]; then
+    RESTORE_CHOICE="n"
+  else
+    read -p "Do you want to restore the previous backup? [y/N]: " RESTORE_CHOICE
+  fi
+  if [[ "$RESTORE_CHOICE" =~ ^[Yy]$ ]]; then
+    restore_from_backup
+  fi
+fi
+
+# Create a new backup directory with a timestamp
+NEW_BACKUP_DIR="$BACKUP_DIR/$TIMESTAMP"
+mkdir -p "$NEW_BACKUP_DIR"
+log "Created backup directory at $NEW_BACKUP_DIR."
+
+# Backup existing configuration files
+cp /etc/network/interfaces "$NEW_BACKUP_DIR/interfaces.bak"
+cp /etc/hosts "$NEW_BACKUP_DIR/hosts.bak"
+hostnamectl status | grep "Static hostname" | awk '{print $3}' > "$NEW_BACKUP_DIR/hostname.bak"
+log "Backed up /etc/network/interfaces, /etc/hosts, and hostname."
+
+# Update the 'latest' symlink to point to the most recent backup
+ln -sfn "$NEW_BACKUP_DIR" "$BACKUP_DIR/latest"
+log "Updated latest backup symlink."
 
 # Default to vmbr0 if not specified
 if [ -z "$INTERFACE" ]; then
@@ -119,32 +175,159 @@ fi
 # Get current settings
 get_current_settings
 
-# Interactive mode if parameters are not provided
-if [ -z "$MODE" ]; then
-  echo "Do you want to configure networking for DHCP or Static IP?"
-  read -p "Enter mode [dhcp/static] [${MODE:-dhcp}]: " INPUT_MODE
-  MODE=${INPUT_MODE:-${MODE:-dhcp}}
-fi
+# Collect user inputs before making changes
+collect_inputs() {
 
-# If interface not provided, prompt for it
-if [ -z "$INTERFACE" ]; then
-  echo "Available network interfaces:"
-  ip -o link show | awk -F': ' '{print $2}'
-  read -p "Enter the network interface to configure [${INTERFACE}]: " INPUT_INTERFACE
-  INTERFACE=${INPUT_INTERFACE:-$INTERFACE}
-fi
+  # Interactive mode if parameters are not provided
+  if [ -z "$MODE" ]; then
+    if [ "$NO_CONFIRM" -eq 1 ]; then
+      MODE="dhcp"
+    else
+      echo "Do you want to configure networking for DHCP or Static IP?"
+      read -p "Enter mode [dhcp/static] [${MODE:-dhcp}]: " INPUT_MODE
+      MODE=${INPUT_MODE:-${MODE:-dhcp}}
+    fi
+  fi
 
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
-log "Created backup directory at $BACKUP_DIR."
+  # If interface not provided, prompt for it
+  if [ -z "$INTERFACE" ]; then
+    if [ "$NO_CONFIRM" -eq 1 ]; then
+      # Use default INTERFACE
+      :
+    else
+      echo "Available network interfaces:"
+      ip -o link show | awk -F': ' '{print $2}'
+      read -p "Enter the network interface to configure [${INTERFACE}]: " INPUT_INTERFACE
+      INTERFACE=${INPUT_INTERFACE:-$INTERFACE}
+    fi
+  fi
 
-# Backup existing configuration files
-cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak"
-cp /etc/hosts "$BACKUP_DIR/hosts.bak"
-log "Backed up /etc/network/interfaces and /etc/hosts."
+  # Get current settings again in case INTERFACE changed
+  get_current_settings
 
-# Save current hostname
-echo "$CURRENT_HOSTNAME" > "$BACKUP_DIR/hostname.bak"
+  if [ "$MODE" == "dhcp" ]; then
+    # DHCP Mode Inputs
+    if [[ "$INTERFACE" == vmbr* ]]; then
+      # Prompt for bridge ports if not provided
+      if [ -z "$BRIDGE_PORTS" ]; then
+        if [ "$NO_CONFIRM" -eq 1 ]; then
+          BRIDGE_PORTS="$CURRENT_BRIDGE_PORTS"
+        else
+          echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
+          read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
+          BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
+        fi
+      fi
+    fi
+  elif [ "$MODE" == "static" ]; then
+    # Static Mode Inputs
+    if [ -z "$IP_ADDRESS" ]; then
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        IP_ADDRESS="$CURRENT_IP"
+      else
+        read -p "Enter IP address [${CURRENT_IP}]: " IP_ADDRESS
+        IP_ADDRESS=${IP_ADDRESS:-$CURRENT_IP}
+      fi
+    fi
+
+    if [ -z "$NETMASK" ]; then
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        NETMASK="$CURRENT_NETMASK"
+      else
+        read -p "Enter Netmask (CIDR notation, e.g., 24) [${CURRENT_NETMASK}]: " NETMASK
+        NETMASK=${NETMASK:-$CURRENT_NETMASK}
+      fi
+    fi
+
+    if [ -z "$GATEWAY" ]; then
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        GATEWAY="$CURRENT_GATEWAY"
+      else
+        read -p "Enter Gateway [${CURRENT_GATEWAY}]: " GATEWAY
+        GATEWAY=${GATEWAY:-$CURRENT_GATEWAY}
+      fi
+    fi
+
+    if [ -z "$DNS_SERVERS" ]; then
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        DNS_SERVERS="$CURRENT_DNS"
+      else
+        read -p "Enter DNS servers (space-separated) [${CURRENT_DNS}]: " DNS_SERVERS
+        DNS_SERVERS=${DNS_SERVERS:-$CURRENT_DNS}
+      fi
+    fi
+
+    if [ -z "$HOSTNAME" ]; then
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        HOSTNAME="$CURRENT_HOSTNAME"
+      else
+        read -p "Enter Hostname [${CURRENT_HOSTNAME}]: " HOSTNAME
+        HOSTNAME=${HOSTNAME:-$CURRENT_HOSTNAME}
+      fi
+    fi
+
+    if [[ "$INTERFACE" == vmbr* ]]; then
+      # Prompt for bridge ports if not provided
+      if [ -z "$BRIDGE_PORTS" ]; then
+        if [ "$NO_CONFIRM" -eq 1 ]; then
+          BRIDGE_PORTS="$CURRENT_BRIDGE_PORTS"
+        else
+          echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
+          read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
+          BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
+        fi
+      fi
+    fi
+  else
+    log "Invalid mode specified. Please choose 'dhcp' or 'static'."
+    usage
+  fi
+
+  # If test IPs not provided, prompt for them
+  if [ ${#TEST_IPS[@]} -eq 0 ]; then
+    if [ "$NO_CONFIRM" -eq 1 ]; then
+      TEST_IPS=("8.8.8.8" "1.1.1.1")
+    else
+      echo "Enter IP addresses to test connectivity (comma-separated) [8.8.8.8,1.1.1.1]:"
+      read -p "Test IPs: " INPUT_TEST_IPS
+      if [ -z "$INPUT_TEST_IPS" ]; then
+        TEST_IPS=("8.8.8.8" "1.1.1.1")
+      else
+        IFS=',' read -ra TEST_IPS <<< "$INPUT_TEST_IPS"
+      fi
+    fi
+  fi
+
+  # Confirm before proceeding (if not in no-confirm mode)
+  if [ "$NO_CONFIRM" -ne 1 ]; then
+    echo ""
+    echo "Configuration Summary:"
+    echo "Mode: $MODE"
+    echo "Interface: $INTERFACE"
+    if [[ "$INTERFACE" == vmbr* ]]; then
+      echo "Bridge Ports: $BRIDGE_PORTS"
+    fi
+    if [ "$MODE" == "static" ]; then
+      echo "IP Address: $IP_ADDRESS/$NETMASK"
+      echo "Gateway: $GATEWAY"
+      echo "DNS Servers: $DNS_SERVERS"
+      echo "Hostname: $HOSTNAME"
+    fi
+    echo "Test IPs: ${TEST_IPS[*]}"
+    echo ""
+    read -p "Proceed with the configuration? [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+      log "Configuration cancelled by user."
+      exit 0
+    fi
+  fi
+}
+
+# Collect inputs
+collect_inputs
+
+# Begin making changes
+log "Starting network configuration."
 
 if [ "$MODE" == "dhcp" ]; then
   # DHCP Mode
@@ -152,13 +335,6 @@ if [ "$MODE" == "dhcp" ]; then
 
   # If the interface is a bridge, configure accordingly
   if [[ "$INTERFACE" == vmbr* ]]; then
-    # Prompt for bridge ports if not provided
-    if [ -z "$BRIDGE_PORTS" ]; then
-      echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
-      read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
-      BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
-    fi
-
     # Set physical interfaces to manual
     PHYSICAL_INTERFACES=""
     for PORT in $BRIDGE_PORTS; do
@@ -195,89 +371,12 @@ EOF
 
   log "Updated /etc/network/interfaces with DHCP configuration for $INTERFACE."
 
-  # Restart networking
-  ifreload -a
-  log "Applied network configuration changes with ifreload -a."
-
-  # If test IPs not provided, prompt for them
-  if [ ${#TEST_IPS[@]} -eq 0 ]; then
-    echo "Enter IP addresses to test connectivity (comma-separated) [8.8.8.8,1.1.1.1]:"
-    read -p "Test IPs: " INPUT_TEST_IPS
-    if [ -z "$INPUT_TEST_IPS" ]; then
-      TEST_IPS=("8.8.8.8" "1.1.1.1")
-    else
-      IFS=',' read -ra TEST_IPS <<< "$INPUT_TEST_IPS"
-    fi
-  fi
-
-  # Test connectivity
-  if test_connectivity; then
-    log "Connectivity test passed."
-  else
-    log "Connectivity test failed."
-    rollback_changes
-    exit 1
-  fi
-
-  # List interfaces
-  list_interfaces
-
-  log "Network interface $INTERFACE has been configured for DHCP."
-
 elif [ "$MODE" == "static" ]; then
   # Static IP Mode
   log "Configuring network interface $INTERFACE with a static IP."
 
-  # Prompt for IP address
-  if [ -z "$IP_ADDRESS" ]; then
-    read -p "Enter IP address [${CURRENT_IP}]: " IP_ADDRESS
-    IP_ADDRESS=${IP_ADDRESS:-$CURRENT_IP}
-  fi
-
-  # Prompt for Netmask
-  if [ -z "$NETMASK" ]; then
-    read -p "Enter Netmask (CIDR notation, e.g., 24) [${CURRENT_NETMASK}]: " NETMASK
-    NETMASK=${NETMASK:-$CURRENT_NETMASK}
-  fi
-
-  # Prompt for Gateway
-  if [ -z "$GATEWAY" ]; then
-    read -p "Enter Gateway [${CURRENT_GATEWAY}]: " GATEWAY
-    GATEWAY=${GATEWAY:-$CURRENT_GATEWAY}
-  fi
-
-  # Prompt for DNS Servers
-  if [ -z "$DNS_SERVERS" ]; then
-    read -p "Enter DNS servers (space-separated) [${CURRENT_DNS}]: " DNS_SERVERS
-    DNS_SERVERS=${DNS_SERVERS:-$CURRENT_DNS}
-  fi
-
-  # Prompt for Hostname
-  if [ -z "$HOSTNAME" ]; then
-    read -p "Enter Hostname [${CURRENT_HOSTNAME}]: " HOSTNAME
-    HOSTNAME=${HOSTNAME:-$CURRENT_HOSTNAME}
-  fi
-
-  # If test IPs not provided, prompt for them
-  if [ ${#TEST_IPS[@]} -eq 0 ]; then
-    echo "Enter IP addresses to test connectivity (comma-separated) [8.8.8.8,1.1.1.1]:"
-    read -p "Test IPs: " INPUT_TEST_IPS
-    if [ -z "$INPUT_TEST_IPS" ]; then
-      TEST_IPS=("8.8.8.8" "1.1.1.1")
-    else
-      IFS=',' read -ra TEST_IPS <<< "$INPUT_TEST_IPS"
-    fi
-  fi
-
   # If the interface is a bridge, configure accordingly
   if [[ "$INTERFACE" == vmbr* ]]; then
-    # Prompt for bridge ports if not provided
-    if [ -z "$BRIDGE_PORTS" ]; then
-      echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
-      read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
-      BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
-    fi
-
     # Set physical interfaces to manual
     PHYSICAL_INTERFACES=""
     for PORT in $BRIDGE_PORTS; do
@@ -328,24 +427,22 @@ EOF
   sed -i "s|127\.0\.1\.1.*|127.0.1.1 $HOSTNAME|" /etc/hosts
   log "Updated /etc/hosts with new hostname."
 
-  # Restart networking
-  ifreload -a
-  log "Applied network configuration changes with ifreload -a."
-
-  # Test connectivity
-  if test_connectivity; then
-    log "Connectivity test passed."
-  else
-    log "Connectivity test failed."
-    rollback_changes
-    exit 1
-  fi
-
-  log "Network interface $INTERFACE has been configured with static IP $IP_ADDRESS/$NETMASK."
-
 else
   log "Invalid mode specified. Please choose 'dhcp' or 'static'."
   usage
+fi
+
+# Restart networking
+ifreload -a
+log "Applied network configuration changes with ifreload -a."
+
+# Test connectivity
+if test_connectivity; then
+  log "Connectivity test passed."
+else
+  log "Connectivity test failed."
+  rollback_changes
+  exit 1
 fi
 
 # Add DHCP client exit hook script to update /etc/hosts
