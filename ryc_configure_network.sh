@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Script to configure network interfaces dynamically using ip command and dhclient
-# Optionally modifies configuration files to make changes persistent
+# Script to configure Proxmox VE networking for DHCP or Static IP
 # Usage: ./network-config.sh [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]
 #        [--gateway GATEWAY] [--dns DNS_SERVERS] [--hostname HOSTNAME]
 #        [--interface INTERFACE] [--persistent] [--no-confirm]
@@ -16,6 +15,11 @@ HOSTNAME=""
 INTERFACE=""
 PERSISTENT=0
 NO_CONFIRM=0
+BACKUP_DIR="/var/backups/network-config"
+LOGFILE="/var/log/network-config.log"
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+TEST_IPS=("8.8.8.8" "1.1.1.1")
+MAX_BACKUPS=5
 
 # Function to display usage
 usage() {
@@ -28,7 +32,7 @@ usage() {
 # Function to log messages
 log() {
   MESSAGE="$1"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') - $MESSAGE"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $MESSAGE" | tee -a "$LOGFILE"
   logger -t network-config.sh "$MESSAGE"
 }
 
@@ -102,7 +106,7 @@ list_interfaces() {
   done
 }
 
-# Collect user inputs before making changes
+# Function to collect user inputs
 collect_inputs() {
   # List existing interfaces
   list_interfaces
@@ -175,10 +179,8 @@ collect_inputs() {
   fi
 
   if [ "$MODE" == "dhcp" ]; then
-    # DHCP Mode Inputs
     :
   elif [ "$MODE" == "static" ]; then
-    # Static Mode Inputs
     if [ -z "$IP_ADDRESS" ]; then
       if [ "$NO_CONFIRM" -eq 1 ]; then
         log "IP address not specified. Exiting."
@@ -230,13 +232,12 @@ collect_inputs() {
         HOSTNAME=${HOSTNAME:-$CURRENT_HOSTNAME}
       fi
     fi
-
   else
     log "Invalid mode specified. Please choose 'dhcp' or 'static'."
     usage
   fi
 
-  # Prompt for persistence
+  # Persistence option
   if [ "$PERSISTENT" -eq 0 ]; then
     if [ "$NO_CONFIRM" -eq 1 ]; then
       PERSISTENT=0
@@ -250,7 +251,7 @@ collect_inputs() {
     fi
   fi
 
-  # Confirm before proceeding (if not in no-confirm mode)
+  # Confirm before proceeding
   if [ "$NO_CONFIRM" -ne 1 ]; then
     echo ""
     echo "Configuration Summary:"
@@ -276,70 +277,73 @@ collect_inputs() {
   fi
 }
 
-# Backup function
+# Function to backup configuration files
 backup_configs() {
-  BACKUP_DIR="/var/backups/network-config-$(date +%F_%T)"
   mkdir -p "$BACKUP_DIR"
-  cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak"
-  cp /etc/hosts "$BACKUP_DIR/hosts.bak"
-  log "Backed up /etc/network/interfaces and /etc/hosts to $BACKUP_DIR."
-}
+  BACKUP_TIMESTAMP=$(date +%Y%m%d%H%M%S)
+  BACKUP_PATH="$BACKUP_DIR/backup_$BACKUP_TIMESTAMP"
+  mkdir -p "$BACKUP_PATH"
 
-# Update /etc/network/interfaces for persistence
-update_interfaces_file() {
-  # Backup before modifying
-  backup_configs
+  [ -f /etc/network/interfaces ] && cp /etc/network/interfaces "$BACKUP_PATH/interfaces.bak"
+  [ -f /etc/hosts ] && cp /etc/hosts "$BACKUP_PATH/hosts.bak"
+  [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "$BACKUP_PATH/resolv.conf.bak"
 
-  # Remove existing configuration for the interface
-  sed -i "/auto $INTERFACE/,+5d" /etc/network/interfaces
+  log "Backed up configuration files to $BACKUP_PATH."
 
-  if [ "$MODE" == "dhcp" ]; then
-    # Append DHCP configuration
-    cat >> /etc/network/interfaces <<EOF
-
-# Configuration for $INTERFACE
-auto $INTERFACE
-iface $INTERFACE inet dhcp
-EOF
-  elif [ "$MODE" == "static" ]; then
-    # Append Static configuration
-    cat >> /etc/network/interfaces <<EOF
-
-# Configuration for $INTERFACE
-auto $INTERFACE
-iface $INTERFACE inet static
-    address $IP_ADDRESS/$NETMASK
-    gateway $GATEWAY
-    dns-nameservers $DNS_SERVERS
-EOF
+  # Manage backups - keep only the original and the last 5 backups
+  TOTAL_BACKUPS=$(ls -d $BACKUP_DIR/backup_* | wc -l)
+  if [ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]; then
+    OLDEST_BACKUP=$(ls -d $BACKUP_DIR/backup_* | head -n 1)
+    rm -rf "$OLDEST_BACKUP"
+    log "Removed oldest backup: $OLDEST_BACKUP"
   fi
-
-  log "Updated /etc/network/interfaces to make changes persistent."
 }
 
-# Update /etc/hosts and hostname
-update_hosts_and_hostname() {
-  # Backup before modifying
-  backup_configs
+# Function to restore backups
+restore_backups() {
+  echo "Available backups:"
+  BACKUP_OPTIONS=()
+  i=1
+  for BACKUP_PATH in $(ls -d $BACKUP_DIR/backup_* | sort -r); do
+    BACKUP_OPTIONS[$i]="$BACKUP_PATH"
+    echo "[$i] - $(basename $BACKUP_PATH)"
+    i=$((i+1))
+  done
 
-  # Update /etc/hosts
-  sed -i "s/127\.0\.1\.1.*/127.0.1.1 $HOSTNAME/" /etc/hosts
+  read -p "Enter the number of the backup to restore: " BACKUP_NUM
+  SELECTED_BACKUP="${BACKUP_OPTIONS[$BACKUP_NUM]}"
 
-  # Update hostname
-  hostnamectl set-hostname "$HOSTNAME"
-
-  log "Updated /etc/hosts and set hostname to $HOSTNAME."
+  if [ -d "$SELECTED_BACKUP" ]; then
+    [ -f "$SELECTED_BACKUP/interfaces.bak" ] && cp "$SELECTED_BACKUP/interfaces.bak" /etc/network/interfaces
+    [ -f "$SELECTED_BACKUP/hosts.bak" ] && cp "$SELECTED_BACKUP/hosts.bak" /etc/hosts
+    [ -f "$SELECTED_BACKUP/resolv.conf.bak" ] && cp "$SELECTED_BACKUP/resolv.conf.bak" /etc/resolv.conf
+    log "Restored configuration files from $SELECTED_BACKUP."
+    systemctl restart networking
+    exit 0
+  else
+    log "Invalid backup selection."
+    exit 1
+  fi
 }
+
+# Check for existing backups and offer to restore
+if [ -d "$BACKUP_DIR" ]; then
+  echo "Existing backups detected."
+  read -p "Do you want to restore a backup? [y/N]: " RESTORE_CHOICE
+  if [[ "$RESTORE_CHOICE" =~ ^[Yy]$ ]]; then
+    restore_backups
+  fi
+fi
 
 # Collect inputs
 collect_inputs
 
-# Begin making changes
+# Begin configuration
 log "Starting network configuration."
 
 if [ "$MODE" == "dhcp" ]; then
   # DHCP Mode
-  log "Configuring network interface $INTERFACE for DHCP."
+  log "Configuring $INTERFACE for DHCP."
 
   # Bring interface down
   ip link set dev "$INTERFACE" down
@@ -356,11 +360,11 @@ if [ "$MODE" == "dhcp" ]; then
   # Start DHCP client
   dhclient "$INTERFACE"
 
-  log "Interface $INTERFACE configured for DHCP."
+  log "$INTERFACE configured for DHCP."
 
 elif [ "$MODE" == "static" ]; then
-  # Static IP Mode
-  log "Configuring network interface $INTERFACE with a static IP."
+  # Static Mode
+  log "Configuring $INTERFACE with static IP."
 
   # Stop DHCP client if running
   if pgrep -a dhclient | grep -q "$INTERFACE"; then
@@ -371,7 +375,7 @@ elif [ "$MODE" == "static" ]; then
   # Bring interface down
   ip link set dev "$INTERFACE" down
 
-  # Flush existing IP addresses
+  # Flush IP addresses
   ip addr flush dev "$INTERFACE"
 
   # Configure IP address
@@ -384,41 +388,31 @@ elif [ "$MODE" == "static" ]; then
   ip link set dev "$INTERFACE" up
 
   # Set DNS servers
-  if command -v resolvectl >/dev/null 2>&1; then
-    # Use resolvectl if available
-    resolvectl dns "$INTERFACE" $DNS_SERVERS
-    log "Configured DNS servers for $INTERFACE using resolvectl."
+  if command -v resolvconf >/dev/null 2>&1; then
+    echo "nameserver $DNS_SERVERS" | resolvconf -a "$INTERFACE"
+    log "Configured DNS servers for $INTERFACE using resolvconf."
   else
-    # Modify /etc/resolv.conf directly
-    echo -e "; Generated by network-config.sh\nnameserver $DNS_SERVERS" > /etc/resolv.conf
+    echo "nameserver $DNS_SERVERS" > /etc/resolv.conf
     log "Configured DNS servers by modifying /etc/resolv.conf."
   fi
 
   # Set Hostname
-  hostname "$HOSTNAME"
+  hostnamectl set-hostname "$HOSTNAME"
   log "Hostname set to $HOSTNAME."
 
-  log "Interface $INTERFACE configured with static IP $IP_ADDRESS/$NETMASK, gateway $GATEWAY, DNS servers $DNS_SERVERS, and hostname $HOSTNAME."
+  # Update /etc/hosts
+  sed -i "s/127\.0\.1\.1.*/127.0.1.1 $HOSTNAME/" /etc/hosts
+  log "Updated /etc/hosts with hostname."
+
+  log "$INTERFACE configured with static IP $IP_ADDRESS/$NETMASK."
 
 else
   log "Invalid mode specified. Exiting."
   exit 1
 fi
 
-# Make changes persistent if requested
-if [ "$PERSISTENT" -eq 1 ]; then
-  update_interfaces_file
-  if [ "$MODE" == "static" ]; then
-    update_hosts_and_hostname
-  fi
-  log "Changes have been made persistent."
-else
-  log "Changes are temporary and will not persist after a reboot."
-fi
-
 # Test connectivity
 test_connectivity() {
-  TEST_IPS=("8.8.8.8" "1.1.1.1")
   for IP in "${TEST_IPS[@]}"; do
     log "Testing connectivity to $IP..."
     if ping -c 3 -W 2 "$IP" > /dev/null 2>&1; then
@@ -437,14 +431,67 @@ else
   log "Connectivity test failed."
   if [ "$PERSISTENT" -eq 1 ]; then
     log "Restoring previous configuration from backup."
-    cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces
-    cp "$BACKUP_DIR/hosts.bak" /etc/hosts
-    systemctl restart networking
-    log "Previous configuration restored."
+    restore_backups
   else
     log "Reboot the machine to revert to previous settings."
   fi
   exit 1
+fi
+
+# Make changes persistent if requested
+if [ "$PERSISTENT" -eq 1 ]; then
+  backup_configs
+
+  # Modify /etc/network/interfaces
+  sed -i "/auto $INTERFACE/,+5d" /etc/network/interfaces
+
+  if [ "$MODE" == "dhcp" ]; then
+    cat >> /etc/network/interfaces <<EOF
+
+# Configuration for $INTERFACE
+auto $INTERFACE
+iface $INTERFACE inet dhcp
+EOF
+  elif [ "$MODE" == "static" ]; then
+    cat >> /etc/network/interfaces <<EOF
+
+# Configuration for $INTERFACE
+auto $INTERFACE
+iface $INTERFACE inet static
+    address $IP_ADDRESS/$NETMASK
+    gateway $GATEWAY
+    dns-nameservers $DNS_SERVERS
+EOF
+  fi
+
+  # Update /etc/hosts and /etc/resolv.conf already done in previous steps
+  log "Changes have been made persistent."
+else
+  log "Changes are temporary and will not persist after a reboot."
+fi
+
+# Insert DHCP hook script if DHCP mode and persistent
+if [ "$MODE" == "dhcp" ] && [ "$PERSISTENT" -eq 1 ]; then
+  DHCP_HOOK_SCRIPT="/etc/dhcp/dhclient-exit-hooks.d/update-etc-hosts"
+  if [ ! -f "$DHCP_HOOK_SCRIPT" ]; then
+    cat > "$DHCP_HOOK_SCRIPT" <<'EOF'
+#!/bin/bash
+
+if ([ "$reason" = "BOUND" ] || [ "$reason" = "RENEW" ]); then
+  HOSTNAME=$(hostname -s)
+  FQDN=$(hostname -f)
+
+  if [ -z "$FQDN" ] || [ "$FQDN" = "(none)" ]; then
+    DOMAIN=$(dnsdomainname)
+    FQDN="$HOSTNAME.$DOMAIN"
+  fi
+
+  sed -i "s|^.*\s$FQDN\s.*$|${new_ip_address} $FQDN $HOSTNAME|" /etc/hosts
+fi
+EOF
+    chmod +x "$DHCP_HOOK_SCRIPT"
+    log "Added DHCP client exit hook script to update /etc/hosts."
+  fi
 fi
 
 log "Configuration complete."
