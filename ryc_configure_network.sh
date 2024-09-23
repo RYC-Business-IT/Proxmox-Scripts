@@ -1,22 +1,27 @@
 #!/bin/bash
 
 # Script to configure network interfaces dynamically using ip command and dhclient
-# Does not modify configuration files
+# Optionally modifies configuration files to make changes persistent
 # Usage: ./network-config.sh [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]
-#        [--gateway GATEWAY] [--interface INTERFACE] [--no-confirm]
+#        [--gateway GATEWAY] [--dns DNS_SERVERS] [--hostname HOSTNAME]
+#        [--interface INTERFACE] [--persistent] [--no-confirm]
 
 # Default variables
 MODE=""
 IP_ADDRESS=""
 NETMASK=""
 GATEWAY=""
+DNS_SERVERS=""
+HOSTNAME=""
 INTERFACE=""
+PERSISTENT=0
 NO_CONFIRM=0
 
 # Function to display usage
 usage() {
   echo "Usage: $0 [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]"
-  echo "          [--gateway GATEWAY] [--interface INTERFACE] [--no-confirm]"
+  echo "          [--gateway GATEWAY] [--dns DNS_SERVERS] [--hostname HOSTNAME]"
+  echo "          [--interface INTERFACE] [--persistent] [--no-confirm]"
   exit 1
 }
 
@@ -34,7 +39,10 @@ while [[ "$#" -gt 0 ]]; do
     --ip) IP_ADDRESS="$2"; shift ;;
     --netmask) NETMASK="$2"; shift ;;
     --gateway) GATEWAY="$2"; shift ;;
+    --dns) DNS_SERVERS="$2"; shift ;;
+    --hostname) HOSTNAME="$2"; shift ;;
     --interface) INTERFACE="$2"; shift ;;
+    --persistent) PERSISTENT=1 ;;
     --no-confirm) NO_CONFIRM=1 ;;
     *) echo "Unknown parameter passed: $1"; usage ;;
   esac
@@ -201,9 +209,45 @@ collect_inputs() {
       fi
     fi
 
+    if [ -z "$DNS_SERVERS" ]; then
+      CURRENT_DNS=$(grep 'nameserver' /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        log "DNS servers not specified. Exiting."
+        exit 1
+      else
+        read -p "Enter DNS servers (space-separated) [$CURRENT_DNS]: " DNS_SERVERS
+        DNS_SERVERS=${DNS_SERVERS:-$CURRENT_DNS}
+      fi
+    fi
+
+    if [ -z "$HOSTNAME" ]; then
+      CURRENT_HOSTNAME=$(hostname)
+      if [ "$NO_CONFIRM" -eq 1 ]; then
+        log "Hostname not specified. Exiting."
+        exit 1
+      else
+        read -p "Enter Hostname [$CURRENT_HOSTNAME]: " HOSTNAME
+        HOSTNAME=${HOSTNAME:-$CURRENT_HOSTNAME}
+      fi
+    fi
+
   else
     log "Invalid mode specified. Please choose 'dhcp' or 'static'."
     usage
+  fi
+
+  # Prompt for persistence
+  if [ "$PERSISTENT" -eq 0 ]; then
+    if [ "$NO_CONFIRM" -eq 1 ]; then
+      PERSISTENT=0
+    else
+      read -p "Do you want to make these changes persistent? [y/N]: " PERSISTENT_CHOICE
+      if [[ "$PERSISTENT_CHOICE" =~ ^[Yy]$ ]]; then
+        PERSISTENT=1
+      else
+        PERSISTENT=0
+      fi
+    fi
   fi
 
   # Confirm before proceeding (if not in no-confirm mode)
@@ -215,6 +259,13 @@ collect_inputs() {
     if [ "$MODE" == "static" ]; then
       echo "IP Address: $IP_ADDRESS/$NETMASK"
       echo "Gateway: $GATEWAY"
+      echo "DNS Servers: $DNS_SERVERS"
+      echo "Hostname: $HOSTNAME"
+    fi
+    if [ "$PERSISTENT" -eq 1 ]; then
+      echo "Changes will be made persistent."
+    else
+      echo "Changes will not be persistent."
     fi
     echo ""
     read -p "Proceed with the configuration? [y/N]: " CONFIRM
@@ -223,6 +274,61 @@ collect_inputs() {
       exit 0
     fi
   fi
+}
+
+# Backup function
+backup_configs() {
+  BACKUP_DIR="/var/backups/network-config-$(date +%F_%T)"
+  mkdir -p "$BACKUP_DIR"
+  cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak"
+  cp /etc/hosts "$BACKUP_DIR/hosts.bak"
+  log "Backed up /etc/network/interfaces and /etc/hosts to $BACKUP_DIR."
+}
+
+# Update /etc/network/interfaces for persistence
+update_interfaces_file() {
+  # Backup before modifying
+  backup_configs
+
+  # Remove existing configuration for the interface
+  sed -i "/auto $INTERFACE/,+5d" /etc/network/interfaces
+
+  if [ "$MODE" == "dhcp" ]; then
+    # Append DHCP configuration
+    cat >> /etc/network/interfaces <<EOF
+
+# Configuration for $INTERFACE
+auto $INTERFACE
+iface $INTERFACE inet dhcp
+EOF
+  elif [ "$MODE" == "static" ]; then
+    # Append Static configuration
+    cat >> /etc/network/interfaces <<EOF
+
+# Configuration for $INTERFACE
+auto $INTERFACE
+iface $INTERFACE inet static
+    address $IP_ADDRESS/$NETMASK
+    gateway $GATEWAY
+    dns-nameservers $DNS_SERVERS
+EOF
+  fi
+
+  log "Updated /etc/network/interfaces to make changes persistent."
+}
+
+# Update /etc/hosts and hostname
+update_hosts_and_hostname() {
+  # Backup before modifying
+  backup_configs
+
+  # Update /etc/hosts
+  sed -i "s/127\.0\.1\.1.*/127.0.1.1 $HOSTNAME/" /etc/hosts
+
+  # Update hostname
+  hostnamectl set-hostname "$HOSTNAME"
+
+  log "Updated /etc/hosts and set hostname to $HOSTNAME."
 }
 
 # Collect inputs
@@ -277,18 +383,67 @@ elif [ "$MODE" == "static" ]; then
   # Bring interface up
   ip link set dev "$INTERFACE" up
 
-  log "Interface $INTERFACE configured with static IP $IP_ADDRESS/$NETMASK and gateway $GATEWAY."
+  # Set DNS servers
+  if command -v resolvectl >/dev/null 2>&1; then
+    # Use resolvectl if available
+    resolvectl dns "$INTERFACE" $DNS_SERVERS
+    log "Configured DNS servers for $INTERFACE using resolvectl."
+  else
+    # Modify /etc/resolv.conf directly
+    echo -e "; Generated by network-config.sh\nnameserver $DNS_SERVERS" > /etc/resolv.conf
+    log "Configured DNS servers by modifying /etc/resolv.conf."
+  fi
+
+  # Set Hostname
+  hostname "$HOSTNAME"
+  log "Hostname set to $HOSTNAME."
+
+  log "Interface $INTERFACE configured with static IP $IP_ADDRESS/$NETMASK, gateway $GATEWAY, DNS servers $DNS_SERVERS, and hostname $HOSTNAME."
 
 else
   log "Invalid mode specified. Exiting."
   exit 1
 fi
 
+# Make changes persistent if requested
+if [ "$PERSISTENT" -eq 1 ]; then
+  update_interfaces_file
+  if [ "$MODE" == "static" ]; then
+    update_hosts_and_hostname
+  fi
+  log "Changes have been made persistent."
+else
+  log "Changes are temporary and will not persist after a reboot."
+fi
+
 # Test connectivity
+test_connectivity() {
+  TEST_IPS=("8.8.8.8" "1.1.1.1")
+  for IP in "${TEST_IPS[@]}"; do
+    log "Testing connectivity to $IP..."
+    if ping -c 3 -W 2 "$IP" > /dev/null 2>&1; then
+      log "Successfully reached $IP."
+      return 0
+    else
+      log "Failed to reach $IP."
+    fi
+  done
+  return 1
+}
+
 if test_connectivity; then
   log "Connectivity test passed."
 else
   log "Connectivity test failed."
+  if [ "$PERSISTENT" -eq 1 ]; then
+    log "Restoring previous configuration from backup."
+    cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces
+    cp "$BACKUP_DIR/hosts.bak" /etc/hosts
+    systemctl restart networking
+    log "Previous configuration restored."
+  else
+    log "Reboot the machine to revert to previous settings."
+  fi
   exit 1
 fi
 
