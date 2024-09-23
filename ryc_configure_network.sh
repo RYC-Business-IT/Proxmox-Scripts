@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to configure network interfaces dynamically using ifupdown2 and ip command
+# Script to configure network interfaces dynamically using ip command and dhclient
 # Does not modify configuration files
 # Usage: ./network-config.sh [--mode dhcp|static] [--ip IP_ADDRESS] [--netmask NETMASK]
 #        [--gateway GATEWAY] [--interface INTERFACE] [--no-confirm]
@@ -49,25 +49,48 @@ fi
 
 # Function to list interfaces with IP addresses and configuration type
 list_interfaces() {
-  echo "Available network interfaces:"
-  echo "Interface    IP Address      Configuration"
-  echo "------------------------------------------"
+  CONFIGURED_INTERFACES=()
+  UNCONFIGURED_INTERFACES=()
+  declare -A INTERFACE_IP_MAP
+  declare -A INTERFACE_CONFIG_TYPE_MAP
+
   for IFACE in $(ls /sys/class/net/); do
     if [[ "$IFACE" == "lo" ]]; then
       continue
     fi
     IP_ADDR=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}(/\d+)?' | head -n1)
-    if [ -z "$IP_ADDR" ]; then
-      CONFIG_TYPE="Unconfigured"
-    else
+    if [ -n "$IP_ADDR" ]; then
       DHCP_CHECK=$(pgrep -a dhclient | grep "$IFACE")
       if [ -n "$DHCP_CHECK" ]; then
         CONFIG_TYPE="DHCP"
       else
         CONFIG_TYPE="Static"
       fi
+      CONFIGURED_INTERFACES+=("$IFACE")
+      INTERFACE_IP_MAP["$IFACE"]="$IP_ADDR"
+      INTERFACE_CONFIG_TYPE_MAP["$IFACE"]="$CONFIG_TYPE"
+    else
+      UNCONFIGURED_INTERFACES+=("$IFACE")
+      INTERFACE_IP_MAP["$IFACE"]="N/A"
+      INTERFACE_CONFIG_TYPE_MAP["$IFACE"]="Unconfigured"
     fi
-    echo -e "$IFACE\t$IP_ADDR\t$CONFIG_TYPE"
+  done
+
+  # Combine configured and unconfigured interfaces
+  INTERFACES_LIST=("${CONFIGURED_INTERFACES[@]}" "${UNCONFIGURED_INTERFACES[@]}")
+
+  echo "Available network interfaces:"
+  printf "%-5s %-15s %-20s %-15s\n" "Num" "Interface" "IP Address" "Configuration"
+  echo "--------------------------------------------------------------"
+
+  INTERFACE_NUMBERS=()
+  i=1
+  for IFACE in "${INTERFACES_LIST[@]}"; do
+    INTERFACE_NUMBERS+=("$IFACE")
+    IP_ADDR=${INTERFACE_IP_MAP["$IFACE"]}
+    CONFIG_TYPE=${INTERFACE_CONFIG_TYPE_MAP["$IFACE"]}
+    printf "%-5s %-15s %-20s %-15s\n" "[$i]" "$IFACE" "$IP_ADDR" "$CONFIG_TYPE"
+    i=$((i+1))
   done
 }
 
@@ -88,21 +111,44 @@ test_connectivity() {
 
 # Collect user inputs before making changes
 collect_inputs() {
-
   # List existing interfaces
   list_interfaces
 
   # If interface not provided, prompt for it
   if [ -z "$INTERFACE" ]; then
+    DEFAULT_INTERFACE=""
+    DEFAULT_INTERFACE_NUM=""
+
+    # Find vmbr0 if available
+    for IDX in "${!INTERFACE_NUMBERS[@]}"; do
+      IFACE="${INTERFACE_NUMBERS[$IDX]}"
+      if [ "$IFACE" == "vmbr0" ]; then
+        DEFAULT_INTERFACE_NUM=$((IDX+1))
+        DEFAULT_INTERFACE="vmbr0"
+        break
+      fi
+    done
+
     if [ "$NO_CONFIRM" -eq 1 ]; then
-      log "Interface not specified. Exiting."
-      exit 1
-    else
-      read -p "Enter the network interface to configure: " INTERFACE
-      if [ -z "$INTERFACE" ]; then
-        log "No interface specified. Exiting."
+      if [ -n "$DEFAULT_INTERFACE" ]; then
+        INTERFACE="$DEFAULT_INTERFACE"
+      else
+        log "Interface not specified and vmbr0 not found. Exiting."
         exit 1
       fi
+    else
+      if [ -n "$DEFAULT_INTERFACE_NUM" ]; then
+        read -p "Enter the number of the network interface to configure [$DEFAULT_INTERFACE_NUM]: " INTERFACE_NUM_INPUT
+        INTERFACE_NUM=${INTERFACE_NUM_INPUT:-$DEFAULT_INTERFACE_NUM}
+      else
+        read -p "Enter the number of the network interface to configure: " INTERFACE_NUM
+      fi
+      if [ -z "$INTERFACE_NUM" ]; then
+        log "No interface selected. Exiting."
+        exit 1
+      fi
+      INTERFACE_INDEX=$((INTERFACE_NUM-1))
+      INTERFACE="${INTERFACE_NUMBERS[$INTERFACE_INDEX]}"
     fi
   fi
 
@@ -211,6 +257,9 @@ if [ "$MODE" == "dhcp" ]; then
   # Release any existing DHCP leases
   dhclient -r "$INTERFACE" > /dev/null 2>&1
 
+  # Flush IP addresses
+  ip addr flush dev "$INTERFACE"
+
   # Bring interface up
   ip link set dev "$INTERFACE" up
 
@@ -232,12 +281,14 @@ elif [ "$MODE" == "static" ]; then
   # Bring interface down
   ip link set dev "$INTERFACE" down
 
-  # Configure IP address
+  # Flush existing IP addresses
   ip addr flush dev "$INTERFACE"
+
+  # Configure IP address
   ip addr add "$IP_ADDRESS"/"$NETMASK" dev "$INTERFACE"
 
   # Configure Gateway
-  ip route add default via "$GATEWAY" dev "$INTERFACE"
+  ip route add default via "$GATEWAY" dev "$INTERFACE" || ip route replace default via "$GATEWAY" dev "$INTERFACE"
 
   # Bring interface up
   ip link set dev "$INTERFACE" up
