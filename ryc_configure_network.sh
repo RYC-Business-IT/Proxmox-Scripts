@@ -64,6 +64,11 @@ get_current_settings() {
   CURRENT_GATEWAY=$(ip route | awk '/default/ {print $3}')
   CURRENT_DNS=$(grep 'nameserver' /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
   CURRENT_HOSTNAME=$(hostname)
+  
+  # Get current bridge ports if interface is a bridge
+  if [[ "$INTERFACE" == vmbr* ]]; then
+    CURRENT_BRIDGE_PORTS=$(bridge link show | grep -B1 "master $INTERFACE" | grep "state UP" | awk '{print $2}' | tr -d ':')
+  fi
 }
 
 # Function to list interfaces
@@ -117,14 +122,15 @@ get_current_settings
 # Interactive mode if parameters are not provided
 if [ -z "$MODE" ]; then
   echo "Do you want to configure networking for DHCP or Static IP?"
-  read -p "Enter mode [dhcp/static]: " MODE
+  read -p "Enter mode [dhcp/static] [${MODE:-dhcp}]: " INPUT_MODE
+  MODE=${INPUT_MODE:-${MODE:-dhcp}}
 fi
 
 # If interface not provided, prompt for it
 if [ -z "$INTERFACE" ]; then
   echo "Available network interfaces:"
   ip -o link show | awk -F': ' '{print $2}'
-  read -p "Enter the network interface to configure [$INTERFACE]: " INPUT_INTERFACE
+  read -p "Enter the network interface to configure [${INTERFACE}]: " INPUT_INTERFACE
   INTERFACE=${INPUT_INTERFACE:-$INTERFACE}
 fi
 
@@ -149,10 +155,12 @@ if [ "$MODE" == "dhcp" ]; then
     # Prompt for bridge ports if not provided
     if [ -z "$BRIDGE_PORTS" ]; then
       echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
-      read -p "Bridge ports: " BRIDGE_PORTS
+      read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
+      BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
     fi
 
     # Set physical interfaces to manual
+    PHYSICAL_INTERFACES=""
     for PORT in $BRIDGE_PORTS; do
       PHYSICAL_INTERFACES+=$'\n'"auto $PORT"$'\n'"iface $PORT inet manual"
     done
@@ -222,31 +230,31 @@ elif [ "$MODE" == "static" ]; then
 
   # Prompt for IP address
   if [ -z "$IP_ADDRESS" ]; then
-    read -p "Enter IP address [$CURRENT_IP]: " IP_ADDRESS
+    read -p "Enter IP address [${CURRENT_IP}]: " IP_ADDRESS
     IP_ADDRESS=${IP_ADDRESS:-$CURRENT_IP}
   fi
 
   # Prompt for Netmask
   if [ -z "$NETMASK" ]; then
-    read -p "Enter Netmask (CIDR notation, e.g., 24) [$CURRENT_NETMASK]: " NETMASK
+    read -p "Enter Netmask (CIDR notation, e.g., 24) [${CURRENT_NETMASK}]: " NETMASK
     NETMASK=${NETMASK:-$CURRENT_NETMASK}
   fi
 
   # Prompt for Gateway
   if [ -z "$GATEWAY" ]; then
-    read -p "Enter Gateway [$CURRENT_GATEWAY]: " GATEWAY
+    read -p "Enter Gateway [${CURRENT_GATEWAY}]: " GATEWAY
     GATEWAY=${GATEWAY:-$CURRENT_GATEWAY}
   fi
 
   # Prompt for DNS Servers
   if [ -z "$DNS_SERVERS" ]; then
-    read -p "Enter DNS servers (space-separated) [$CURRENT_DNS]: " DNS_SERVERS
+    read -p "Enter DNS servers (space-separated) [${CURRENT_DNS}]: " DNS_SERVERS
     DNS_SERVERS=${DNS_SERVERS:-$CURRENT_DNS}
   fi
 
   # Prompt for Hostname
   if [ -z "$HOSTNAME" ]; then
-    read -p "Enter Hostname [$CURRENT_HOSTNAME]: " HOSTNAME
+    read -p "Enter Hostname [${CURRENT_HOSTNAME}]: " HOSTNAME
     HOSTNAME=${HOSTNAME:-$CURRENT_HOSTNAME}
   fi
 
@@ -266,10 +274,12 @@ elif [ "$MODE" == "static" ]; then
     # Prompt for bridge ports if not provided
     if [ -z "$BRIDGE_PORTS" ]; then
       echo "Enter physical interface(s) to bridge (e.g., eth0). Separate multiple interfaces with spaces."
-      read -p "Bridge ports: " BRIDGE_PORTS
+      read -p "Bridge ports [${CURRENT_BRIDGE_PORTS}]: " INPUT_BRIDGE_PORTS
+      BRIDGE_PORTS=${INPUT_BRIDGE_PORTS:-$CURRENT_BRIDGE_PORTS}
     fi
 
     # Set physical interfaces to manual
+    PHYSICAL_INTERFACES=""
     for PORT in $BRIDGE_PORTS; do
       PHYSICAL_INTERFACES+=$'\n'"auto $PORT"$'\n'"iface $PORT inet manual"
     done
